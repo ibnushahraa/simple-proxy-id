@@ -73,7 +73,7 @@ app.listen(3000);
 ```js
 const express = require('express');
 const { createProxyMiddleware } = require('simple-proxy-id');
-const createLogger = require('simple-proxy-id/src/plugins/logger');
+const createLogger = require('simple-proxy-id/logger');
 
 const app = express();
 
@@ -164,7 +164,7 @@ Create logger middleware for tracking requests.
 
 **Example:**
 ```js
-const createLogger = require('simple-proxy-id/src/plugins/logger');
+const createLogger = require('simple-proxy-id/logger');
 
 app.use(createLogger({
   logDir: './logs',
