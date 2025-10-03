@@ -41,32 +41,63 @@ function filterHeaders(headers) {
   return filtered;
 }
 
-/**
- * Helper: Forward request to target without dependencies
- */
-function forwardRequest(clientReq, clientRes, targetUrl, changeOrigin = false) {
-  const target = new URL(targetUrl);
-  const isHttps = target.protocol === 'https:';
+// Create HTTP/HTTPS agents with keep-alive for connection pooling
+const httpAgent = new http.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 256,
+  maxFreeSockets: 256,
+  timeout: 30000
+});
 
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 256,
+  maxFreeSockets: 256,
+  timeout: 30000
+});
+
+// Pre-compute error responses for better performance
+const ERROR_TIMEOUT = JSON.stringify({
+  error: 'Gateway Timeout',
+  message: 'Target server took too long to respond'
+});
+
+const ERROR_PROXY = JSON.stringify({
+  error: 'Proxy Error',
+  message: 'An error occurred during proxy request'
+});
+
+/**
+ * Helper: Forward request to target without dependencies (optimized)
+ * @param {Object} clientReq - Client request
+ * @param {Object} clientRes - Client response
+ * @param {Object} targetParsed - Pre-parsed target URL
+ * @param {boolean} changeOrigin - Whether to change origin header
+ * @param {Object} agent - HTTP/HTTPS agent for connection pooling
+ */
+function forwardRequest(clientReq, clientRes, targetParsed, changeOrigin, agent) {
   // Prepare options for target request
   const options = {
-    hostname: target.hostname,
-    port: target.port || (isHttps ? 443 : 80),
+    hostname: targetParsed.hostname,
+    port: targetParsed.port,
     path: clientReq.url,
     method: clientReq.method,
-    headers: filterHeaders(clientReq.headers)
+    headers: filterHeaders(clientReq.headers),
+    agent: agent
   };
 
   // Change origin if requested
   if (changeOrigin) {
-    options.headers.host = target.host;
+    options.headers.host = targetParsed.host;
   } else {
     // Remove host header from client to avoid conflicts
     delete options.headers.host;
   }
 
   // Choose http or https
-  const protocol = isHttps ? https : http;
+  const protocol = targetParsed.isHttps ? https : http;
 
   // Create request to target
   const proxyReq = protocol.request(options, (proxyRes) => {
@@ -77,6 +108,9 @@ function forwardRequest(clientReq, clientRes, targetUrl, changeOrigin = false) {
     proxyRes.pipe(clientRes);
   });
 
+  // Enable TCP_NODELAY for lower latency
+  proxyReq.setNoDelay(true);
+
   // Set timeout for proxy request (30 seconds)
   proxyReq.setTimeout(30000, () => {
     console.error('Proxy Error: Request timeout');
@@ -84,10 +118,7 @@ function forwardRequest(clientReq, clientRes, targetUrl, changeOrigin = false) {
 
     if (!clientRes.headersSent) {
       clientRes.writeHead(504, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({
-        error: 'Gateway Timeout',
-        message: 'Target server took too long to respond'
-      }));
+      clientRes.end(ERROR_TIMEOUT);
     }
   });
 
@@ -97,10 +128,7 @@ function forwardRequest(clientReq, clientRes, targetUrl, changeOrigin = false) {
 
     if (!clientRes.headersSent) {
       clientRes.writeHead(500, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({
-        error: 'Proxy Error',
-        message: 'An error occurred during proxy request'
-      }));
+      clientRes.end(ERROR_PROXY);
     }
   });
 
@@ -117,6 +145,12 @@ function forwardRequest(clientReq, clientRes, targetUrl, changeOrigin = false) {
  * @param {Object} options.logger - Logger configuration (optional)
  * @param {string} options.logger.logDir - Directory to store log files (default: './logs')
  * @param {number} options.logger.maxDays - Maximum days to keep logs (default: 7)
+ * @param {Object|Array} options.attackDetector - Attack detector configuration (optional, single or array)
+ * @param {string|RegExp} options.attackDetector.path - Path to monitor
+ * @param {number} options.attackDetector.statusCode - Status code to monitor
+ * @param {number} options.attackDetector.threshold - Max hits before trigger
+ * @param {number} options.attackDetector.timeWindow - Time window in ms
+ * @param {Function} options.attackDetector.onTrigger - Callback function
  * @returns {http.Server} HTTP Server instance
  */
 function createProxy(options = {}) {
@@ -128,33 +162,67 @@ function createProxy(options = {}) {
     target,
     changeOrigin = false,
     port = 3000,
-    logger: loggerOptions
+    logger: loggerOptions,
+    attackDetector: attackDetectorOptions
   } = options;
 
-  // Validate target is a valid URL
+  // Parse and cache target URL (performance optimization)
+  let targetParsed;
   try {
-    new URL(target);
+    const targetUrl = new URL(target);
+    const isHttps = targetUrl.protocol === 'https:';
+    targetParsed = {
+      hostname: targetUrl.hostname,
+      port: targetUrl.port || (isHttps ? 443 : 80),
+      host: targetUrl.host,
+      isHttps: isHttps
+    };
   } catch (err) {
     throw new Error('Target must be a valid URL');
   }
 
+  // Select appropriate agent based on protocol (performance optimization)
+  const agent = targetParsed.isHttps ? httpsAgent : httpAgent;
+
   // Setup logger if enabled
   let loggerMiddleware = null;
   if (loggerOptions) {
-    const createLogger = require('./plugins/logger');
+    const createLogger = require('./logger');
     loggerMiddleware = createLogger(loggerOptions);
+  }
+
+  // Setup attack detector(s) if enabled
+  let attackDetectorMiddlewares = [];
+  if (attackDetectorOptions) {
+    const createAttackDetector = require('./attack-detector');
+    const detectors = Array.isArray(attackDetectorOptions) ? attackDetectorOptions : [attackDetectorOptions];
+    attackDetectorMiddlewares = detectors.map(opts => createAttackDetector(opts));
   }
 
   // Create HTTP server
   const server = http.createServer((req, res) => {
-    // Apply logger middleware if enabled
-    if (loggerMiddleware) {
-      loggerMiddleware(req, res, () => {
-        forwardRequest(req, res, target, changeOrigin);
-      });
-    } else {
-      forwardRequest(req, res, target, changeOrigin);
-    }
+    // Chain middlewares: logger -> attack detectors -> proxy
+    let index = 0;
+
+    const next = () => {
+      // Apply logger first
+      if (index === 0 && loggerMiddleware) {
+        index++;
+        return loggerMiddleware(req, res, next);
+      }
+
+      // Apply attack detectors
+      const detectorIndex = loggerMiddleware ? index - 1 : index;
+      if (detectorIndex < attackDetectorMiddlewares.length) {
+        index++;
+        return attackDetectorMiddlewares[detectorIndex](req, res, next);
+      }
+
+      // Finally, forward request with cached target and agent
+      forwardRequest(req, res, targetParsed, changeOrigin, agent);
+    };
+
+    next();
   });
 
   // Start server
@@ -163,6 +231,10 @@ function createProxy(options = {}) {
     console.log(`Forwarding requests to: ${target}`);
     if (loggerOptions) {
       console.log(`Logger enabled: ${loggerOptions.logDir || './logs'}`);
+    }
+    if (attackDetectorOptions) {
+      const count = Array.isArray(attackDetectorOptions) ? attackDetectorOptions.length : 1;
+      console.log(`Attack detector enabled: ${count} detector(s)`);
     }
   });
 
@@ -186,12 +258,23 @@ function createProxyMiddleware(options = {}) {
     changeOrigin = false
   } = options;
 
-  // Validate target is a valid URL
+  // Parse and cache target URL (performance optimization)
+  let targetParsed;
   try {
-    new URL(target);
+    const targetUrl = new URL(target);
+    const isHttps = targetUrl.protocol === 'https:';
+    targetParsed = {
+      hostname: targetUrl.hostname,
+      port: targetUrl.port || (isHttps ? 443 : 80),
+      host: targetUrl.host,
+      isHttps: isHttps
+    };
   } catch (err) {
     throw new Error('Target must be a valid URL');
   }
+
+  // Select appropriate agent based on protocol (performance optimization)
+  const agent = targetParsed.isHttps ? httpsAgent : httpAgent;
 
   // Return middleware function
   return (req, res, next) => {
@@ -203,15 +286,12 @@ function createProxyMiddleware(options = {}) {
       if (!res.headersSent) {
         res.statusCode = 500;
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({
-          error: 'Proxy Error',
-          message: 'An error occurred during proxy request'
-        }));
+        res.end(ERROR_PROXY);
       }
     };
 
     try {
-      forwardRequest(req, res, target, changeOrigin);
+      forwardRequest(req, res, targetParsed, changeOrigin, agent);
 
       // Intercept error from forwardRequest
       res.on('error', errorHandler);
